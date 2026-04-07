@@ -1,0 +1,13 @@
+{
+  "name": "realmatka-backend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "start:dev": "node server.mjs",
+    "check:syntax": "node --check server.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.20.0"
+  }
+}
