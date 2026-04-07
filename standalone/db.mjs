@@ -1,5 +1,5 @@
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Pool } from "pg";
@@ -11,6 +11,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const backendRoot = path.resolve(__dirname, "..");
 const sqlitePath = path.join(backendRoot, "data", "server.db");
+const postgresSchemaSql = readFileSync(path.join(backendRoot, "postgres-schema.sql"), "utf8");
 const sessionTtlMs = standaloneConfig.sessionTtlHours * 60 * 60 * 1000;
 const signupBonusAmount = 25;
 
@@ -421,6 +422,10 @@ async function ensurePostgresBootstrap(pool) {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      const usersTableExists = Boolean((await client.query(`SELECT to_regclass('public.users') AS value`)).rows[0]?.value);
+      if (!usersTableExists) {
+        await client.query(postgresSchemaSql);
+      }
       await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked_at TIMESTAMPTZ`);
       await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS deactivated_at TIMESTAMPTZ`);
       await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS status_note TEXT`);
