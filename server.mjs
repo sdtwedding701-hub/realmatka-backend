@@ -53,6 +53,7 @@ const configuredCorsOrigins = [
   process.env.EXPO_PUBLIC_APP_URL,
   process.env.ADMIN_DOMAIN,
   process.env.PUBLIC_API_ORIGIN,
+  process.env.EXTRA_CORS_ORIGINS,
   "http://localhost:8085",
   "http://localhost:8083",
   "http://localhost:8082",
