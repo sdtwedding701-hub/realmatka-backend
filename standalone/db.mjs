@@ -77,13 +77,6 @@ const seededMarkets = [
   ["seed_mangal_bazar", "mangal-bazar", "Mangal Bazar", "***-**-***", "Betting open now", "Place Bet", "10:05 PM", "11:05 PM", "main"]
 ];
 
-const sampleChartRows = [
-  ["05-Feb", "470", "237", "450"],
-  ["12-Feb", "368", "125", "359"],
-  ["19-Feb", "689", "148", "567"],
-  ["26-Feb", "570", "299", "118"]
-];
-
 function nowIso() {
   return new Date().toISOString();
 }
@@ -491,15 +484,6 @@ async function ensurePostgresBootstrap(pool) {
              close_time = EXCLUDED.close_time,
              category = EXCLUDED.category`,
           market
-        );
-      }
-
-      for (const market of seededMarkets) {
-        await client.query(
-          `INSERT INTO charts (market_slug, chart_type, rows_json)
-           VALUES ($1, 'jodi', $2::jsonb), ($1, 'panna', $2::jsonb)
-           ON CONFLICT (market_slug, chart_type) DO NOTHING`,
-          [market[1], JSON.stringify(sampleChartRows)]
         );
       }
 
