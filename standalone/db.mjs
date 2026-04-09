@@ -36,9 +36,9 @@ const defaultWalletEntry = {
   userId: defaultUser.id,
   type: "DEPOSIT",
   status: "SUCCESS",
-  amount: 1560,
+  amount: 0,
   beforeBalance: 0,
-  afterBalance: 1560
+  afterBalance: 0
 };
 
 const seededMarkets = [
@@ -229,6 +229,27 @@ function mapWalletEntryRow(row) {
         proofUrl: row.proof_url ?? "",
         note: row.note ?? "",
         createdAt: toIso(row.created_at)
+      }
+    : null;
+}
+
+function mapPaymentOrderRow(row) {
+  return row
+    ? {
+        id: row.id,
+        userId: row.user_id,
+        provider: row.provider,
+        amount: Number(row.amount),
+        status: row.status,
+        reference: row.reference,
+        checkoutToken: row.checkout_token ?? null,
+        gatewayOrderId: row.gateway_order_id ?? null,
+        gatewayPaymentId: row.gateway_payment_id ?? null,
+        gatewaySignature: row.gateway_signature ?? null,
+        verifiedAt: toIso(row.verified_at),
+        redirectUrl: row.redirect_url ?? null,
+        createdAt: toIso(row.created_at),
+        updatedAt: toIso(row.updated_at)
       }
     : null;
 }
@@ -425,6 +446,11 @@ async function ensurePostgresBootstrap(pool) {
       await client.query(`ALTER TABLE wallet_entries ADD COLUMN IF NOT EXISTS reference_id TEXT`);
       await client.query(`ALTER TABLE wallet_entries ADD COLUMN IF NOT EXISTS proof_url TEXT`);
       await client.query(`ALTER TABLE wallet_entries ADD COLUMN IF NOT EXISTS note TEXT`);
+      await client.query(`ALTER TABLE payment_orders ADD COLUMN IF NOT EXISTS checkout_token TEXT`);
+      await client.query(`ALTER TABLE payment_orders ADD COLUMN IF NOT EXISTS gateway_order_id TEXT`);
+      await client.query(`ALTER TABLE payment_orders ADD COLUMN IF NOT EXISTS gateway_payment_id TEXT`);
+      await client.query(`ALTER TABLE payment_orders ADD COLUMN IF NOT EXISTS gateway_signature TEXT`);
+      await client.query(`ALTER TABLE payment_orders ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ`);
       await client.query(`
         CREATE TABLE IF NOT EXISTS app_settings (
           setting_key TEXT PRIMARY KEY,
@@ -617,6 +643,11 @@ function getSqlite() {
       amount REAL NOT NULL,
       status TEXT NOT NULL,
       reference TEXT NOT NULL UNIQUE,
+      checkout_token TEXT,
+      gateway_order_id TEXT,
+      gateway_payment_id TEXT,
+      gateway_signature TEXT,
+      verified_at TEXT,
       redirect_url TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
@@ -668,6 +699,11 @@ function getSqlite() {
   ensureSqliteColumn(sqlite, "wallet_entries", "reference_id", "TEXT");
   ensureSqliteColumn(sqlite, "wallet_entries", "proof_url", "TEXT");
   ensureSqliteColumn(sqlite, "wallet_entries", "note", "TEXT");
+  ensureSqliteColumn(sqlite, "payment_orders", "checkout_token", "TEXT");
+  ensureSqliteColumn(sqlite, "payment_orders", "gateway_order_id", "TEXT");
+  ensureSqliteColumn(sqlite, "payment_orders", "gateway_payment_id", "TEXT");
+  ensureSqliteColumn(sqlite, "payment_orders", "gateway_signature", "TEXT");
+  ensureSqliteColumn(sqlite, "payment_orders", "verified_at", "TEXT");
 
   const userCount = Number(sqlite.prepare("SELECT COUNT(*) AS count FROM users").get().count || 0);
   if (userCount === 0) {
@@ -693,7 +729,7 @@ function getSqlite() {
     sqlite.prepare(`
       INSERT INTO wallet_entries (id, user_id, type, status, amount, before_balance, after_balance, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run("wallet_1", defaultUser.id, "DEPOSIT", "SUCCESS", 1560, 0, 1560, nowIso());
+    `).run("wallet_1", defaultUser.id, "DEPOSIT", "SUCCESS", 0, 0, 0, nowIso());
   }
 
   const marketCount = Number(sqlite.prepare("SELECT COUNT(*) AS count FROM markets").get().count || 0);
@@ -1643,30 +1679,217 @@ export async function listAllBids(limit = 300) {
     .map((row) => mapBidRow(row));
 }
 
-export async function createPaymentOrder({ userId, amount }) {
+async function findPaymentOrderById(paymentOrderId) {
+  if (isStandalonePostgresEnabled()) {
+    const pool = getPgPool();
+    const result = await pool.query(
+      `SELECT id, user_id, provider, amount, status, reference, checkout_token, gateway_order_id, gateway_payment_id, gateway_signature, verified_at, redirect_url, created_at, updated_at
+       FROM payment_orders
+       WHERE id = $1
+       LIMIT 1`,
+      [paymentOrderId]
+    );
+    return mapPaymentOrderRow(result.rows[0]);
+  }
+
+  return mapPaymentOrderRow(
+    getSqlite()
+      .prepare(
+        `SELECT id, user_id, provider, amount, status, reference, checkout_token, gateway_order_id, gateway_payment_id, gateway_signature, verified_at, redirect_url, created_at, updated_at
+         FROM payment_orders
+         WHERE id = ?
+         LIMIT 1`
+      )
+      .get(paymentOrderId)
+  );
+}
+
+export async function findPaymentOrderForCheckout(paymentOrderId, checkoutToken) {
+  const order = await findPaymentOrderById(paymentOrderId);
+  if (!order || !checkoutToken || order.checkoutToken !== checkoutToken) {
+    return null;
+  }
+  return order;
+}
+
+export async function createPaymentOrder({
+  id = `payment_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+  userId,
+  amount,
+  provider = "manual",
+  reference = `RM${Date.now()}`,
+  checkoutToken = null,
+  gatewayOrderId = null,
+  redirectUrl = null
+}) {
   const createdAt = nowIso();
-  const id = `payment_${Date.now()}`;
-  const reference = `RM${Date.now()}`;
-  const provider = "manual";
   const status = "PENDING";
 
   if (isStandalonePostgresEnabled()) {
     const pool = getPgPool();
     await pool.query(
-      `INSERT INTO payment_orders (id, user_id, provider, amount, status, reference, redirect_url, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $7)`,
-      [id, userId, provider, amount, status, reference, createdAt]
+      `INSERT INTO payment_orders (id, user_id, provider, amount, status, reference, checkout_token, gateway_order_id, redirect_url, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)`,
+      [id, userId, provider, amount, status, reference, checkoutToken, gatewayOrderId, redirectUrl, createdAt]
     );
   } else {
     getSqlite()
       .prepare(
-        `INSERT INTO payment_orders (id, user_id, provider, amount, status, reference, redirect_url, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)`
+        `INSERT INTO payment_orders (id, user_id, provider, amount, status, reference, checkout_token, gateway_order_id, redirect_url, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
-      .run(id, userId, provider, amount, status, reference, createdAt, createdAt);
+      .run(id, userId, provider, amount, status, reference, checkoutToken, gatewayOrderId, redirectUrl, createdAt, createdAt);
   }
 
-  return { id, provider, amount, status, reference, redirectUrl: null };
+  return findPaymentOrderById(id);
+}
+
+export async function completePaymentOrder({ paymentOrderId, gatewayOrderId, gatewayPaymentId, gatewaySignature }) {
+  const verifiedAt = nowIso();
+
+  if (isStandalonePostgresEnabled()) {
+    const pool = getPgPool();
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const existingResult = await client.query(
+        `SELECT id, user_id, provider, amount, status, reference, checkout_token, gateway_order_id, gateway_payment_id, gateway_signature, verified_at, redirect_url, created_at, updated_at
+         FROM payment_orders
+         WHERE id = $1
+         FOR UPDATE`,
+        [paymentOrderId]
+      );
+      const existing = existingResult.rows[0];
+      if (!existing) {
+        await client.query("ROLLBACK");
+        return null;
+      }
+      if (existing.gateway_order_id && existing.gateway_order_id !== gatewayOrderId) {
+        throw new Error("Gateway order mismatch");
+      }
+      if (existing.status !== "SUCCESS") {
+        const currentBalance = Number(
+          (
+            await client.query(
+              `SELECT COALESCE(
+                 (
+                   SELECT after_balance
+                   FROM wallet_entries
+                   WHERE user_id = $1
+                   ORDER BY created_at DESC, id DESC
+                   LIMIT 1
+                 ),
+                 0
+               ) AS balance`,
+              [existing.user_id]
+            )
+          ).rows[0]?.balance ?? 0
+        );
+        const nextBalance = currentBalance + Number(existing.amount);
+        await client.query(
+          `UPDATE payment_orders
+           SET status = 'SUCCESS',
+               gateway_order_id = $2,
+               gateway_payment_id = $3,
+               gateway_signature = $4,
+               verified_at = $5,
+               updated_at = $5
+           WHERE id = $1`,
+          [paymentOrderId, gatewayOrderId, gatewayPaymentId, gatewaySignature, verifiedAt]
+        );
+        await client.query(
+          `INSERT INTO wallet_entries (id, user_id, type, status, amount, before_balance, after_balance, reference_id, note, created_at)
+           VALUES ($1, $2, 'DEPOSIT', 'SUCCESS', $3, $4, $5, $6, $7, $8)`,
+          [
+            `wallet_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            existing.user_id,
+            Number(existing.amount),
+            currentBalance,
+            nextBalance,
+            gatewayPaymentId,
+            `Razorpay payment ${gatewayPaymentId}`,
+            verifiedAt
+          ]
+        );
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    return findPaymentOrderById(paymentOrderId);
+  }
+
+  const db = getSqlite();
+  db.exec("BEGIN");
+  try {
+    const existing = db
+      .prepare(
+        `SELECT id, user_id, provider, amount, status, reference, checkout_token, gateway_order_id, gateway_payment_id, gateway_signature, verified_at, redirect_url, created_at, updated_at
+         FROM payment_orders
+         WHERE id = ?
+         LIMIT 1`
+      )
+      .get(paymentOrderId);
+    if (!existing) {
+      db.exec("ROLLBACK");
+      return null;
+    }
+    if (existing.gateway_order_id && existing.gateway_order_id !== gatewayOrderId) {
+      throw new Error("Gateway order mismatch");
+    }
+    if (existing.status !== "SUCCESS") {
+      const currentBalance = Number(
+        db
+          .prepare(
+            `SELECT COALESCE(
+               (
+                 SELECT after_balance
+                 FROM wallet_entries
+                 WHERE user_id = ?
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1
+               ),
+               0
+             ) AS balance`
+          )
+          .get(existing.user_id)?.balance ?? 0
+      );
+      const nextBalance = currentBalance + Number(existing.amount);
+      db.prepare(
+        `UPDATE payment_orders
+         SET status = 'SUCCESS',
+             gateway_order_id = ?,
+             gateway_payment_id = ?,
+             gateway_signature = ?,
+             verified_at = ?,
+             updated_at = ?
+         WHERE id = ?`
+      ).run(gatewayOrderId, gatewayPaymentId, gatewaySignature, verifiedAt, verifiedAt, paymentOrderId);
+      db.prepare(
+        `INSERT INTO wallet_entries (id, user_id, type, status, amount, before_balance, after_balance, reference_id, note, created_at)
+         VALUES (?, ?, 'DEPOSIT', 'SUCCESS', ?, ?, ?, ?, ?, ?)`
+      ).run(
+        `wallet_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        existing.user_id,
+        Number(existing.amount),
+        currentBalance,
+        nextBalance,
+        gatewayPaymentId,
+        `Razorpay payment ${gatewayPaymentId}`,
+        verifiedAt
+      );
+    }
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+
+  return findPaymentOrderById(paymentOrderId);
 }
 
 export async function handlePaymentWebhook(reference, status) {
@@ -1676,37 +1899,24 @@ export async function handlePaymentWebhook(reference, status) {
       `UPDATE payment_orders
        SET status = $2, updated_at = $3
        WHERE reference = $1
-       RETURNING id, provider, amount, status, reference, redirect_url`,
+       RETURNING id, user_id, provider, amount, status, reference, checkout_token, gateway_order_id, gateway_payment_id, gateway_signature, verified_at, redirect_url, created_at, updated_at`,
       [reference, status, nowIso()]
     );
-    const row = result.rows[0];
-    return row
-      ? {
-          id: row.id,
-          provider: row.provider,
-          amount: Number(row.amount),
-          status: row.status,
-          reference: row.reference,
-          redirectUrl: row.redirect_url ?? null
-        }
-      : null;
+    return mapPaymentOrderRow(result.rows[0]);
   }
 
   const db = getSqlite();
   db.prepare(`UPDATE payment_orders SET status = ?, updated_at = ? WHERE reference = ?`).run(status, nowIso(), reference);
-  const row = db
-    .prepare(`SELECT id, provider, amount, status, reference, redirect_url FROM payment_orders WHERE reference = ? LIMIT 1`)
-    .get(reference);
-  return row
-    ? {
-        id: row.id,
-        provider: row.provider,
-        amount: Number(row.amount),
-        status: row.status,
-        reference: row.reference,
-        redirectUrl: row.redirect_url ?? null
-      }
-      : null;
+  return mapPaymentOrderRow(
+    db
+      .prepare(
+        `SELECT id, user_id, provider, amount, status, reference, checkout_token, gateway_order_id, gateway_payment_id, gateway_signature, verified_at, redirect_url, created_at, updated_at
+         FROM payment_orders
+         WHERE reference = ?
+         LIMIT 1`
+      )
+      .get(reference)
+  );
 }
 
 async function findWalletEntryById(entryId) {
@@ -1731,6 +1941,37 @@ async function findWalletEntryById(entryId) {
            LIMIT 1`
         )
       .get(entryId)
+  );
+}
+
+export async function findWalletEntryByReferenceId(userId, referenceId) {
+  if (!referenceId) {
+    return null;
+  }
+
+  if (isStandalonePostgresEnabled()) {
+    const pool = getPgPool();
+    const result = await pool.query(
+      `SELECT id, user_id, type, status, amount, before_balance, after_balance, reference_id, proof_url, note, created_at
+       FROM wallet_entries
+       WHERE user_id = $1 AND reference_id = $2
+       ORDER BY created_at DESC, id DESC
+       LIMIT 1`,
+      [userId, referenceId]
+    );
+    return mapWalletEntryRow(result.rows[0]);
+  }
+
+  return mapWalletEntryRow(
+    getSqlite()
+      .prepare(
+        `SELECT id, user_id, type, status, amount, before_balance, after_balance, reference_id, proof_url, note, created_at
+         FROM wallet_entries
+         WHERE user_id = ? AND reference_id = ?
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1`
+      )
+      .get(userId, referenceId)
   );
 }
 
