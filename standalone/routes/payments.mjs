@@ -341,6 +341,7 @@ export async function reportUpiDeposit(request) {
   const referenceId = String(body.referenceId ?? "").trim();
   const appName = String(body.appName ?? "UPI").trim() || "UPI";
   const rawResponse = String(body.rawResponse ?? "").trim();
+  const utr = String(body.utr ?? "").trim();
   const appReportedStatus = String(body.appReportedStatus ?? "").trim().toUpperCase();
   const mappedStatus = normalizeUpiClientStatus(appReportedStatus);
 
@@ -350,22 +351,27 @@ export async function reportUpiDeposit(request) {
   if (!mappedStatus) {
     return fail("Unsupported appReportedStatus", 400, request);
   }
+  if ((appReportedStatus === "SUCCESS" || appReportedStatus === "SUBMITTED") && !utr) {
+    return fail("UTR / Ref No is required for successful payments", 400, request);
+  }
 
   const existing = await findWalletEntryByReferenceId(user.id, referenceId);
   if (!existing) {
     return fail("Deposit request not found", 404, request);
   }
 
-  const nextNote = JSON.stringify({
-    channel: "upi_intent",
-    appName,
-    appReportedStatus,
-    rawResponse
-  });
+  const nextNote = [
+    `UPI App: ${appName}`,
+    `Client Status: ${appReportedStatus}`,
+    utr ? `UTR: ${utr}` : "",
+    rawResponse ? `Raw: ${rawResponse}` : ""
+  ]
+    .filter(Boolean)
+    .join(" | ");
 
   const updated = await updateWalletEntryAdmin(existing.id, {
     status: mappedStatus,
-    referenceId,
+    referenceId: utr || referenceId,
     note: nextNote
   });
 
