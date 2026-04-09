@@ -2,6 +2,48 @@ import { createSession, findUserByPhone, hashCredential, updateUserPassword } fr
 import { corsPreflight, fail, getJsonBody, normalizeIndianPhone, ok } from "../http.mjs";
 
 const challenges = new Map();
+const otpProvider = String(process.env.OTP_PROVIDER || "local").trim().toLowerCase();
+const twilioAccountSid = String(process.env.TWILIO_ACCOUNT_SID || "").trim();
+const twilioAuthToken = String(process.env.TWILIO_AUTH_TOKEN || "").trim();
+const twilioVerifyServiceSid = String(process.env.TWILIO_VERIFY_SERVICE_SID || "").trim();
+
+function isTwilioEnabled() {
+  return otpProvider === "twilio" && Boolean(twilioAccountSid && twilioAuthToken && twilioVerifyServiceSid);
+}
+
+function getTwilioAuthHeader() {
+  return `Basic ${Buffer.from(`${twilioAccountSid}:${twilioAuthToken}`).toString("base64")}`;
+}
+
+async function twilioRequest(path, body) {
+  const response = await fetch(`https://verify.twilio.com/v2/Services/${twilioVerifyServiceSid}${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: getTwilioAuthHeader(),
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: new URLSearchParams(body).toString()
+  });
+
+  const raw = await response.text();
+  let payload = null;
+  try {
+    payload = raw ? JSON.parse(raw) : null;
+  } catch {
+    payload = null;
+  }
+
+  if (!response.ok) {
+    const message =
+      payload?.message ||
+      payload?.detail ||
+      payload?.details ||
+      `Twilio request failed with status ${response.status}`;
+    throw new Error(message);
+  }
+
+  return payload;
+}
 
 function getRequestFingerprint(request, namespace, value = "") {
   const forwarded = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "";
@@ -31,6 +73,21 @@ function createOtpCode() {
 }
 
 async function sendOtp(phone, purpose) {
+  if (isTwilioEnabled()) {
+    const payload = await twilioRequest("/Verifications", {
+      To: `+91${phone}`,
+      Channel: "sms"
+    });
+    return {
+      sent: true,
+      expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+      provider: "twilio",
+      devCode: null,
+      sid: payload?.sid ?? null,
+      status: payload?.status ?? "pending"
+    };
+  }
+
   const code = createOtpCode();
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
   challenges.set(`${phone}:${purpose}`, { code, expiresAt });
@@ -43,6 +100,14 @@ async function sendOtp(phone, purpose) {
 }
 
 export async function verifyOtp(phone, purpose, code) {
+  if (isTwilioEnabled()) {
+    const payload = await twilioRequest("/VerificationCheck", {
+      To: `+91${phone}`,
+      Code: code
+    });
+    return payload?.status === "approved" || payload?.valid === true;
+  }
+
   const challenge = challenges.get(`${phone}:${purpose}`);
   if (!challenge) {
     return false;
