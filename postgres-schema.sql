@@ -122,6 +122,11 @@ CREATE TABLE payment_orders (
   amount NUMERIC(12,2) NOT NULL,
   status TEXT NOT NULL,
   reference TEXT UNIQUE NOT NULL,
+  checkout_token TEXT,
+  gateway_order_id TEXT,
+  gateway_payment_id TEXT,
+  gateway_signature TEXT,
+  verified_at TIMESTAMPTZ,
   redirect_url TEXT,
   created_at TIMESTAMPTZ NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL
