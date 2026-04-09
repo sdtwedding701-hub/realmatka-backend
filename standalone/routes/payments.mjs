@@ -351,10 +351,6 @@ export async function reportUpiDeposit(request) {
   if (!mappedStatus) {
     return fail("Unsupported appReportedStatus", 400, request);
   }
-  if ((appReportedStatus === "SUCCESS" || appReportedStatus === "SUBMITTED") && !utr) {
-    return fail("UTR / Ref No is required for successful payments", 400, request);
-  }
-
   const existing = await findWalletEntryByReferenceId(user.id, referenceId);
   if (!existing) {
     return fail("Deposit request not found", 404, request);
@@ -376,6 +372,26 @@ export async function reportUpiDeposit(request) {
   });
 
   return ok(updated, request);
+}
+
+export async function getUpiDepositStatus(request) {
+  const user = await requireUserByToken(getSessionToken(request));
+  if (!user) {
+    return unauthorized(request);
+  }
+
+  const body = request.method.toUpperCase() === "GET" ? getRequestParams(request) : await getJsonBody(request);
+  const referenceId = String(body.referenceId ?? "").trim();
+  if (!referenceId) {
+    return fail("referenceId is required", 400, request);
+  }
+
+  const existing = await findWalletEntryByReferenceId(user.id, referenceId);
+  if (!existing) {
+    return fail("Deposit request not found", 404, request);
+  }
+
+  return ok(existing, request);
 }
 
 export async function checkoutPage(request) {

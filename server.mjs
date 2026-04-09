@@ -123,6 +123,7 @@ const standaloneRoutes = new Map([
   ["/api/payments/create-order", { OPTIONS: paymentsRoutes.options, POST: paymentsRoutes.createOrder }],
   ["/api/payments/upi-start", { OPTIONS: paymentsRoutes.options, GET: paymentsRoutes.startUpiDeposit, POST: paymentsRoutes.startUpiDeposit }],
   ["/api/payments/upi-report", { OPTIONS: paymentsRoutes.options, GET: paymentsRoutes.reportUpiDeposit, POST: paymentsRoutes.reportUpiDeposit }],
+  ["/api/payments/upi-status", { OPTIONS: paymentsRoutes.options, GET: paymentsRoutes.getUpiDepositStatus, POST: paymentsRoutes.getUpiDepositStatus }],
   ["/api/payments/webhook", { OPTIONS: paymentsRoutes.options, POST: paymentsRoutes.webhook }],
   ["/api/settings", { OPTIONS: adminRoutes.options, GET: adminRoutes.settingsPublic }],
   ["/api/admin/users", { OPTIONS: adminRoutes.options, GET: adminRoutes.users }],
