@@ -121,6 +121,8 @@ const standaloneRoutes = new Map([
   ["/api/notifications/history", { OPTIONS: notificationsRoutes.options, GET: notificationsRoutes.history }],
   ["/api/notifications/devices/register", { OPTIONS: notificationsRoutes.options, POST: notificationsRoutes.registerDevice }],
   ["/api/payments/create-order", { OPTIONS: paymentsRoutes.options, POST: paymentsRoutes.createOrder }],
+  ["/api/payments/upi-start", { OPTIONS: paymentsRoutes.options, POST: paymentsRoutes.startUpiDeposit }],
+  ["/api/payments/upi-report", { OPTIONS: paymentsRoutes.options, POST: paymentsRoutes.reportUpiDeposit }],
   ["/api/payments/webhook", { OPTIONS: paymentsRoutes.options, POST: paymentsRoutes.webhook }],
   ["/api/settings", { OPTIONS: adminRoutes.options, GET: adminRoutes.settingsPublic }],
   ["/api/admin/users", { OPTIONS: adminRoutes.options, GET: adminRoutes.users }],
@@ -155,8 +157,15 @@ async function loadManifest() {
     return cachedManifest;
   }
 
-  const rawManifest = await readFile(routesManifestPath, "utf8");
-  const parsed = JSON.parse(rawManifest);
+  let parsed = {};
+  try {
+    const rawManifest = await readFile(routesManifestPath, "utf8");
+    parsed = JSON.parse(rawManifest);
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+  }
 
   cachedManifest = {
     apiRoutes: (parsed.apiRoutes || []).map((route) => ({
@@ -357,6 +366,20 @@ const server = createServer(async (req, res) => {
         service: "realmatka-api",
         timestamp: new Date().toISOString()
       });
+      return;
+    }
+
+    if (pathname === "/payments/checkout") {
+      const webRequest = toWebRequest(req);
+      const webResponse = await paymentsRoutes.checkoutPage(webRequest);
+      await sendWebResponse(res, webResponse);
+      return;
+    }
+
+    if (pathname === "/payments/callback") {
+      const webRequest = toWebRequest(req);
+      const webResponse = await paymentsRoutes.callbackPage(webRequest);
+      await sendWebResponse(res, webResponse);
       return;
     }
 
