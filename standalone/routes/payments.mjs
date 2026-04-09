@@ -1,5 +1,225 @@
+import { createHmac, randomBytes } from "node:crypto";
+import {
+  completePaymentOrder,
+  createPaymentOrder,
+  findWalletEntryByReferenceId,
+  findPaymentOrderForCheckout,
+  findUserById,
+  getUserBalance,
+  requireUserByToken
+} from "../db.mjs";
+import { addWalletEntry, updateWalletEntryAdmin } from "../db.mjs";
 import { corsPreflight, fail, getJsonBody, getSessionToken, ok, unauthorized } from "../http.mjs";
-import { createPaymentOrder, handlePaymentWebhook, requireUserByToken } from "../db.mjs";
+import { standaloneConfig } from "../config.mjs";
+
+const razorpayKeyId = process.env.RAZORPAY_KEY_ID?.trim() || "";
+const razorpayKeySecret = process.env.RAZORPAY_KEY_SECRET?.trim() || "";
+
+function isRazorpayEnabled() {
+  return Boolean(razorpayKeyId && razorpayKeySecret);
+}
+
+function getServerOrigin(request) {
+  const requestUrl = new URL(request.url);
+  const configuredOrigin = process.env.PUBLIC_API_ORIGIN?.trim() || standaloneConfig.apiUrl;
+  if (/^https?:\/\//i.test(configuredOrigin || "")) {
+    return configuredOrigin.replace(/\/$/, "");
+  }
+  return requestUrl.origin.replace(/\/$/, "");
+}
+
+function roundToPaise(amount) {
+  return Math.round(Number(amount || 0) * 100);
+}
+
+function getRazorpayAuthHeader() {
+  return `Basic ${Buffer.from(`${razorpayKeyId}:${razorpayKeySecret}`).toString("base64")}`;
+}
+
+async function createRazorpayOrder({ amountPaise, receipt, paymentOrderId, userId }) {
+  const response = await fetch("https://api.razorpay.com/v1/orders", {
+    method: "POST",
+    headers: {
+      Authorization: getRazorpayAuthHeader(),
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      amount: amountPaise,
+      currency: "INR",
+      receipt,
+      notes: {
+        paymentOrderId,
+        userId
+      }
+    })
+  });
+
+  const payload = await response.json().catch(() => null);
+  if (!response.ok || !payload?.id) {
+    throw new Error(payload?.error?.description || payload?.description || "Unable to create Razorpay order");
+  }
+
+  return payload;
+}
+
+function verifyRazorpaySignature({ orderId, paymentId, signature }) {
+  const expected = createHmac("sha256", razorpayKeySecret).update(`${orderId}|${paymentId}`).digest("hex");
+  return expected === signature;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderHtml(content, status = 200) {
+  return new Response(content, {
+    status,
+    headers: {
+      "Content-Type": "text/html; charset=utf-8"
+    }
+  });
+}
+
+function buildHostedCheckoutHtml({ serverOrigin, paymentOrder, user, callbackUrl }) {
+  const amountPaise = roundToPaise(paymentOrder.amount);
+  const prefllPhone = user?.phone ? `+91${user.phone}` : "";
+  const customerName = user?.name || "Real Matka User";
+  const pageTitle = `Real Matka Deposit ${paymentOrder.reference}`;
+
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${escapeHtml(pageTitle)}</title>
+    <style>
+      body { margin: 0; font-family: Arial, sans-serif; background: #0b0b0b; color: #fff; display: flex; min-height: 100vh; align-items: center; justify-content: center; }
+      .card { width: min(460px, calc(100vw - 32px)); background: #fff; color: #111; border-radius: 20px; padding: 28px; box-shadow: 0 30px 60px rgba(0,0,0,.35); }
+      .eyebrow { font-size: 12px; letter-spacing: .18em; text-transform: uppercase; color: #666; }
+      h1 { margin: 10px 0 8px; font-size: 28px; }
+      p { margin: 0 0 14px; color: #555; line-height: 1.5; }
+      .meta { background: #f5f5f5; border-radius: 14px; padding: 14px; margin: 18px 0; }
+      .meta strong { display: block; font-size: 24px; color: #111; }
+      button { width: 100%; min-height: 52px; border: 0; border-radius: 999px; background: #111; color: #fff; font-size: 16px; font-weight: 700; cursor: pointer; }
+      .secondary { margin-top: 10px; background: #efefef; color: #111; }
+      .help { margin-top: 16px; font-size: 13px; color: #666; text-align: center; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div class="eyebrow">Test Mode Deposit</div>
+      <h1>Complete Wallet Deposit</h1>
+      <p>You will be redirected to Razorpay secure checkout. Use Razorpay test UPI/card details to complete the payment.</p>
+      <div class="meta">
+        <span>Amount</span>
+        <strong>Rs. ${escapeHtml(paymentOrder.amount.toFixed(2))}</strong>
+        <span>Reference: ${escapeHtml(paymentOrder.reference)}</span>
+      </div>
+      <button id="pay-now">Pay Now</button>
+      <button id="retry" class="secondary" type="button">Retry Checkout</button>
+      <div class="help">If the checkout does not open automatically, tap Pay Now again.</div>
+    </div>
+
+    <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+    <script>
+      const options = {
+        key: ${JSON.stringify(razorpayKeyId)},
+        amount: ${JSON.stringify(String(amountPaise))},
+        currency: "INR",
+        name: "Real Matka",
+        description: "Wallet Deposit",
+        order_id: ${JSON.stringify(paymentOrder.gatewayOrderId)},
+        callback_url: ${JSON.stringify(callbackUrl)},
+        redirect: true,
+        prefill: {
+          name: ${JSON.stringify(customerName)},
+          contact: ${JSON.stringify(prefllPhone)}
+        },
+        notes: {
+          reference: ${JSON.stringify(paymentOrder.reference)},
+          payment_order_id: ${JSON.stringify(paymentOrder.id)}
+        },
+        theme: {
+          color: "#111111"
+        },
+        modal: {
+          ondismiss: function () {
+            document.querySelector(".help").textContent = "Checkout closed. Tap Retry Checkout to try again.";
+          }
+        }
+      };
+
+      const openCheckout = function () {
+        const checkout = new Razorpay(options);
+        checkout.open();
+      };
+
+      document.getElementById("pay-now").addEventListener("click", function (event) {
+        event.preventDefault();
+        openCheckout();
+      });
+
+      document.getElementById("retry").addEventListener("click", function (event) {
+        event.preventDefault();
+        openCheckout();
+      });
+
+      window.addEventListener("load", function () {
+        setTimeout(openCheckout, 250);
+      });
+    </script>
+  </body>
+</html>`;
+}
+
+function buildPaymentResultHtml({ title, message, actionLabel, actionHref }) {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${escapeHtml(title)}</title>
+    <style>
+      body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; background: #0b0b0b; font-family: Arial, sans-serif; color: #fff; }
+      .card { width: min(420px, calc(100vw - 32px)); background: #fff; color: #111; border-radius: 20px; padding: 28px; text-align: center; }
+      h1 { margin: 0 0 12px; font-size: 28px; }
+      p { margin: 0 0 18px; color: #555; line-height: 1.5; }
+      a { display: inline-flex; align-items: center; justify-content: center; min-height: 48px; padding: 0 20px; border-radius: 999px; background: #111; color: #fff; text-decoration: none; font-weight: 700; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>${escapeHtml(title)}</h1>
+      <p>${escapeHtml(message)}</p>
+      <a href="${escapeHtml(actionHref)}">${escapeHtml(actionLabel)}</a>
+    </div>
+  </body>
+</html>`;
+}
+
+async function getCallbackPayload(request) {
+  const contentType = request.headers.get("content-type") || "";
+  if (/application\/x-www-form-urlencoded/i.test(contentType) || /multipart\/form-data/i.test(contentType)) {
+    const form = await request.formData();
+    return {
+      razorpayPaymentId: String(form.get("razorpay_payment_id") ?? "").trim(),
+      razorpayOrderId: String(form.get("razorpay_order_id") ?? "").trim(),
+      razorpaySignature: String(form.get("razorpay_signature") ?? "").trim()
+    };
+  }
+
+  const body = await getJsonBody(request);
+  return {
+    razorpayPaymentId: String(body.razorpay_payment_id ?? "").trim(),
+    razorpayOrderId: String(body.razorpay_order_id ?? "").trim(),
+    razorpaySignature: String(body.razorpay_signature ?? "").trim()
+  };
+}
 
 export function options(request) {
   return corsPreflight(request);
@@ -10,29 +230,251 @@ export async function createOrder(request) {
   if (!user) {
     return unauthorized(request);
   }
+  if (!isRazorpayEnabled()) {
+    return fail("Razorpay test mode keys are not configured", 503, request);
+  }
 
   const body = await getJsonBody(request);
   const amount = Number(body.amount ?? 0);
+  const platform = String(body.platform ?? "web").trim().toLowerCase();
+  const amountPaise = roundToPaise(amount);
+  if (amountPaise < 100) {
+    return fail("Minimum deposit is Rs. 1", 400, request);
+  }
+
+  const paymentOrderId = `payment_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const reference = `RM${Date.now()}${Math.random().toString(36).slice(2, 4).toUpperCase()}`.slice(0, 40);
+  const checkoutToken = randomBytes(24).toString("hex");
+  const razorpayOrder = await createRazorpayOrder({
+    amountPaise,
+    receipt: reference,
+    paymentOrderId,
+    userId: user.id
+  });
+  const serverOrigin = getServerOrigin(request);
+  const redirectUrl = `${serverOrigin}/payments/checkout?paymentOrderId=${encodeURIComponent(paymentOrderId)}&token=${encodeURIComponent(checkoutToken)}&platform=${encodeURIComponent(platform || "web")}`;
+
+  const order = await createPaymentOrder({
+    id: paymentOrderId,
+    userId: user.id,
+    amount,
+    provider: "razorpay",
+    reference,
+    checkoutToken,
+    gatewayOrderId: razorpayOrder.id,
+    redirectUrl
+  });
+
+  return ok(order, request);
+}
+
+function normalizeUpiClientStatus(value) {
+  const status = String(value ?? "").trim().toUpperCase();
+  if (status === "SUCCESS") {
+    return "INITIATED";
+  }
+  if (status === "SUBMITTED") {
+    return "INITIATED";
+  }
+  if (status === "FAILED") {
+    return "FAILED";
+  }
+  if (status === "CANCELLED") {
+    return "CANCELLED";
+  }
+  return "";
+}
+
+function getRequestParams(request) {
+  const url = new URL(request.url);
+  return Object.fromEntries(url.searchParams.entries());
+}
+
+export async function startUpiDeposit(request) {
+  const user = await requireUserByToken(getSessionToken(request));
+  if (!user) {
+    return unauthorized(request);
+  }
+
+  const body = request.method.toUpperCase() === "GET" ? getRequestParams(request) : await getJsonBody(request);
+  const amount = Number(body.amount ?? 0);
+  const appName = String(body.appName ?? "UPI").trim() || "UPI";
+  const referenceId = String(body.referenceId ?? "").trim();
   if (amount <= 0) {
     return fail("Amount must be greater than 0", 400, request);
   }
+  if (!referenceId) {
+    return fail("referenceId is required", 400, request);
+  }
 
-  return ok(await createPaymentOrder({ userId: user.id, amount }), request);
+  const existing = await findWalletEntryByReferenceId(user.id, referenceId);
+  if (existing) {
+    return ok(existing, request);
+  }
+
+  const beforeBalance = await getUserBalance(user.id);
+  const entry = await addWalletEntry({
+    userId: user.id,
+    type: "DEPOSIT",
+    status: "INITIATED",
+    amount,
+    beforeBalance,
+    afterBalance: beforeBalance,
+    referenceId,
+    note: JSON.stringify({
+      channel: "upi_intent",
+      appName,
+      appReportedStatus: "STARTED"
+    })
+  });
+
+  return ok(entry, request);
+}
+
+export async function reportUpiDeposit(request) {
+  const user = await requireUserByToken(getSessionToken(request));
+  if (!user) {
+    return unauthorized(request);
+  }
+
+  const body = request.method.toUpperCase() === "GET" ? getRequestParams(request) : await getJsonBody(request);
+  const referenceId = String(body.referenceId ?? "").trim();
+  const appName = String(body.appName ?? "UPI").trim() || "UPI";
+  const rawResponse = String(body.rawResponse ?? "").trim();
+  const appReportedStatus = String(body.appReportedStatus ?? "").trim().toUpperCase();
+  const mappedStatus = normalizeUpiClientStatus(appReportedStatus);
+
+  if (!referenceId) {
+    return fail("referenceId is required", 400, request);
+  }
+  if (!mappedStatus) {
+    return fail("Unsupported appReportedStatus", 400, request);
+  }
+
+  const existing = await findWalletEntryByReferenceId(user.id, referenceId);
+  if (!existing) {
+    return fail("Deposit request not found", 404, request);
+  }
+
+  const nextNote = JSON.stringify({
+    channel: "upi_intent",
+    appName,
+    appReportedStatus,
+    rawResponse
+  });
+
+  const updated = await updateWalletEntryAdmin(existing.id, {
+    status: mappedStatus,
+    referenceId,
+    note: nextNote
+  });
+
+  return ok(updated, request);
+}
+
+export async function checkoutPage(request) {
+  const url = new URL(request.url);
+  const paymentOrderId = String(url.searchParams.get("paymentOrderId") ?? "").trim();
+  const checkoutToken = String(url.searchParams.get("token") ?? "").trim();
+
+  const paymentOrder = await findPaymentOrderForCheckout(paymentOrderId, checkoutToken);
+  if (!paymentOrder) {
+    return renderHtml(buildPaymentResultHtml({
+      title: "Invalid Payment Link",
+      message: "This deposit session is invalid or has expired. Please start a new payment from the app.",
+      actionLabel: "Back to Website",
+      actionHref: standaloneConfig.appUrl || "https://play.realmatka.in"
+    }), 404);
+  }
+
+  const user = await findUserById(paymentOrder.userId);
+  const serverOrigin = getServerOrigin(request);
+  const callbackUrl = `${serverOrigin}/payments/callback?paymentOrderId=${encodeURIComponent(paymentOrder.id)}&token=${encodeURIComponent(checkoutToken)}&platform=${encodeURIComponent(
+    String(url.searchParams.get("platform") ?? "web").trim().toLowerCase()
+  )}`;
+
+  return renderHtml(buildHostedCheckoutHtml({ serverOrigin, paymentOrder, user, callbackUrl }));
+}
+
+export async function callbackPage(request) {
+  const url = new URL(request.url);
+  const paymentOrderId = String(url.searchParams.get("paymentOrderId") ?? "").trim();
+  const checkoutToken = String(url.searchParams.get("token") ?? "").trim();
+  const platform = String(url.searchParams.get("platform") ?? "web").trim().toLowerCase();
+  const paymentOrder = await findPaymentOrderForCheckout(paymentOrderId, checkoutToken);
+
+  if (!paymentOrder) {
+    return renderHtml(
+      buildPaymentResultHtml({
+        title: "Payment Session Invalid",
+        message: "This payment session could not be verified. Please start a fresh deposit request.",
+        actionLabel: "Back to Website",
+        actionHref: standaloneConfig.appUrl || "https://play.realmatka.in"
+      }),
+      404
+    );
+  }
+
+  const payload = await getCallbackPayload(request);
+  if (!payload.razorpayPaymentId || !payload.razorpayOrderId || !payload.razorpaySignature) {
+    return renderHtml(
+      buildPaymentResultHtml({
+        title: "Payment Incomplete",
+        message: "Razorpay did not return a valid payment confirmation. Please retry the deposit.",
+        actionLabel: "Retry Deposit",
+        actionHref: paymentOrder.redirectUrl || standaloneConfig.appUrl || "https://play.realmatka.in"
+      }),
+      400
+    );
+  }
+
+  if (!verifyRazorpaySignature({
+    orderId: payload.razorpayOrderId,
+    paymentId: payload.razorpayPaymentId,
+    signature: payload.razorpaySignature
+  })) {
+    return renderHtml(
+      buildPaymentResultHtml({
+        title: "Payment Verification Failed",
+        message: "The payment signature could not be verified. Your wallet was not credited.",
+        actionLabel: "Back to Website",
+        actionHref: standaloneConfig.appUrl || "https://play.realmatka.in"
+      }),
+      400
+    );
+  }
+
+  await completePaymentOrder({
+    paymentOrderId: paymentOrder.id,
+    gatewayOrderId: payload.razorpayOrderId,
+    gatewayPaymentId: payload.razorpayPaymentId,
+    gatewaySignature: payload.razorpaySignature
+  });
+
+  const webReturnUrl = `${(standaloneConfig.appUrl || "https://play.realmatka.in").replace(/\/$/, "")}/wallet/history?payment=success&reference=${encodeURIComponent(
+    paymentOrder.reference
+  )}`;
+
+  if (platform === "web") {
+    return new Response(null, {
+      status: 302,
+      headers: {
+        Location: webReturnUrl
+      }
+    });
+  }
+
+  return renderHtml(
+    buildPaymentResultHtml({
+      title: "Payment Successful",
+      message: "Your wallet has been credited. You can now return to the app and refresh your wallet history.",
+      actionLabel: "Open Web Wallet",
+      actionHref: webReturnUrl
+    })
+  );
 }
 
 export async function webhook(request) {
   const body = await getJsonBody(request);
-  const reference = String(body.reference ?? "").trim();
-  const status = String(body.status ?? "PENDING").trim();
-
-  if (!reference) {
-    return fail("reference is required", 400, request);
-  }
-
-  const order = await handlePaymentWebhook(reference, status);
-  if (!order) {
-    return fail("Payment order not found", 404, request);
-  }
-
-  return ok(order, request);
+  return ok({ received: true, body }, request);
 }
