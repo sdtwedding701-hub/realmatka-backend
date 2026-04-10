@@ -1,6 +1,7 @@
 import { createHmac, randomBytes } from "node:crypto";
 import {
   completePaymentOrder,
+  completePaymentLinkOrder,
   createPaymentOrder,
   findWalletEntryByReferenceId,
   findPaymentOrderForCheckout,
@@ -14,6 +15,7 @@ import { standaloneConfig } from "../config.mjs";
 
 const razorpayKeyId = process.env.RAZORPAY_KEY_ID?.trim() || "";
 const razorpayKeySecret = process.env.RAZORPAY_KEY_SECRET?.trim() || "";
+const razorpayWebhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET?.trim() || "";
 
 function isRazorpayEnabled() {
   return Boolean(razorpayKeyId && razorpayKeySecret);
@@ -80,6 +82,14 @@ async function createRazorpayPaymentLink({ amountPaise, receipt, paymentOrderId,
 
 function verifyRazorpaySignature({ orderId, paymentId, signature }) {
   const expected = createHmac("sha256", razorpayKeySecret).update(`${orderId}|${paymentId}`).digest("hex");
+  return expected === signature;
+}
+
+function verifyRazorpayWebhookSignature(rawBody, signature) {
+  if (!razorpayWebhookSecret || !signature) {
+    return false;
+  }
+  const expected = createHmac("sha256", razorpayWebhookSecret).update(rawBody).digest("hex");
   return expected === signature;
 }
 
@@ -512,6 +522,53 @@ export async function callbackPage(request) {
 }
 
 export async function webhook(request) {
-  const body = await getJsonBody(request);
-  return ok({ received: true, body }, request);
+  const rawBody = await request.text();
+  const signature = request.headers.get("x-razorpay-signature")?.trim() || "";
+
+  if (!razorpayWebhookSecret) {
+    return fail("Razorpay webhook secret is not configured", 503, request);
+  }
+
+  if (!verifyRazorpayWebhookSignature(rawBody, signature)) {
+    return fail("Invalid webhook signature", 400, request);
+  }
+
+  let body = {};
+  try {
+    body = rawBody ? JSON.parse(rawBody) : {};
+  } catch {
+    return fail("Invalid webhook payload", 400, request);
+  }
+
+  const event = String(body?.event || "").trim();
+  const paymentLinkEntity = body?.payload?.payment_link?.entity || {};
+  const orderEntity = body?.payload?.order?.entity || {};
+  const paymentEntity = body?.payload?.payment?.entity || {};
+  const reference =
+    String(paymentLinkEntity.reference_id || paymentLinkEntity.reference || orderEntity.receipt || "").trim();
+  const gatewayOrderId =
+    String(paymentLinkEntity.order_id || orderEntity.order_id || orderEntity.id || "").trim();
+  const gatewayPaymentId =
+    String(paymentEntity.id || orderEntity.payment_id || orderEntity.id || "").trim();
+
+  if (event === "payment_link.paid") {
+    const updated = await completePaymentLinkOrder({
+      reference,
+      gatewayOrderId,
+      gatewayPaymentId,
+      gatewaySignature: signature
+    });
+
+    if (!updated) {
+      return fail("Payment link order not found", 404, request);
+    }
+
+    return ok({ received: true, event, status: "SUCCESS", order: updated }, request);
+  }
+
+  if (event === "payment_link.cancelled" || event === "payment_link.expired") {
+    return ok({ received: true, event, status: "IGNORED" }, request);
+  }
+
+  return ok({ received: true, event, status: "IGNORED" }, request);
 }

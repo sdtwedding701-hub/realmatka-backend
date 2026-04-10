@@ -1704,6 +1704,35 @@ async function findPaymentOrderById(paymentOrderId) {
   );
 }
 
+async function findPaymentOrderByReference(reference) {
+  if (!reference) {
+    return null;
+  }
+
+  if (isStandalonePostgresEnabled()) {
+    const pool = getPgPool();
+    const result = await pool.query(
+      `SELECT id, user_id, provider, amount, status, reference, checkout_token, gateway_order_id, gateway_payment_id, gateway_signature, verified_at, redirect_url, created_at, updated_at
+       FROM payment_orders
+       WHERE reference = $1
+       LIMIT 1`,
+      [reference]
+    );
+    return mapPaymentOrderRow(result.rows[0]);
+  }
+
+  return mapPaymentOrderRow(
+    getSqlite()
+      .prepare(
+        `SELECT id, user_id, provider, amount, status, reference, checkout_token, gateway_order_id, gateway_payment_id, gateway_signature, verified_at, redirect_url, created_at, updated_at
+         FROM payment_orders
+         WHERE reference = ?
+         LIMIT 1`
+      )
+      .get(reference)
+  );
+}
+
 export async function findPaymentOrderForCheckout(paymentOrderId, checkoutToken) {
   const order = await findPaymentOrderById(paymentOrderId);
   if (!order || !checkoutToken || order.checkoutToken !== checkoutToken) {
@@ -1890,6 +1919,24 @@ export async function completePaymentOrder({ paymentOrderId, gatewayOrderId, gat
   }
 
   return findPaymentOrderById(paymentOrderId);
+}
+
+export async function completePaymentLinkOrder({ reference, gatewayOrderId, gatewayPaymentId, gatewaySignature = "payment_link_webhook" }) {
+  if (!reference) {
+    return null;
+  }
+
+  const existingOrder = await findPaymentOrderByReference(reference);
+  if (!existingOrder) {
+    return null;
+  }
+
+  return completePaymentOrder({
+    paymentOrderId: existingOrder.id,
+    gatewayOrderId: gatewayOrderId || existingOrder.gatewayOrderId || `plink_${reference}`,
+    gatewayPaymentId: gatewayPaymentId || existingOrder.gatewayPaymentId || `plinkpay_${reference}`,
+    gatewaySignature
+  });
 }
 
 export async function handlePaymentWebhook(reference, status) {
