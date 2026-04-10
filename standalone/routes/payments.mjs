@@ -39,8 +39,13 @@ function getRazorpayAuthHeader() {
   return `Basic ${Buffer.from(`${razorpayKeyId}:${razorpayKeySecret}`).toString("base64")}`;
 }
 
-async function createRazorpayOrder({ amountPaise, receipt, paymentOrderId, userId }) {
-  const response = await fetch("https://api.razorpay.com/v1/orders", {
+async function createRazorpayPaymentLink({ amountPaise, receipt, paymentOrderId, user }) {
+  const appReturnBase = (standaloneConfig.appUrl || "https://play.realmatka.in").replace(/\/$/, "");
+  const callbackUrl = `${appReturnBase}/wallet/payment-success?referenceId=${encodeURIComponent(receipt)}&amount=${encodeURIComponent(
+    (amountPaise / 100).toFixed(2)
+  )}`;
+
+  const response = await fetch("https://api.razorpay.com/v1/payment_links", {
     method: "POST",
     headers: {
       Authorization: getRazorpayAuthHeader(),
@@ -49,17 +54,25 @@ async function createRazorpayOrder({ amountPaise, receipt, paymentOrderId, userI
     body: JSON.stringify({
       amount: amountPaise,
       currency: "INR",
-      receipt,
+      upi_link: true,
+      reference_id: receipt,
+      description: "Real Matka Wallet Deposit",
+      callback_url: callbackUrl,
+      callback_method: "get",
+      customer: {
+        name: user?.name || "Real Matka User",
+        contact: user?.phone ? `+91${user.phone}` : undefined
+      },
       notes: {
         paymentOrderId,
-        userId
+        userId: user?.id || ""
       }
     })
   });
 
   const payload = await response.json().catch(() => null);
-  if (!response.ok || !payload?.id) {
-    throw new Error(payload?.error?.description || payload?.description || "Unable to create Razorpay order");
+  if (!response.ok || !payload?.id || !payload?.short_url) {
+    throw new Error(payload?.error?.description || payload?.description || "Unable to create Razorpay payment link");
   }
 
   return payload;
@@ -248,23 +261,22 @@ export async function createOrder(request) {
   const paymentOrderId = `payment_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const reference = `RM${Date.now()}${Math.random().toString(36).slice(2, 4).toUpperCase()}`.slice(0, 40);
   const checkoutToken = randomBytes(24).toString("hex");
-  const razorpayOrder = await createRazorpayOrder({
+  const razorpayPaymentLink = await createRazorpayPaymentLink({
     amountPaise,
     receipt: reference,
     paymentOrderId,
-    userId: user.id
+    user
   });
-  const serverOrigin = getServerOrigin(request);
-  const redirectUrl = `${serverOrigin}/payments/checkout?paymentOrderId=${encodeURIComponent(paymentOrderId)}&token=${encodeURIComponent(checkoutToken)}&platform=${encodeURIComponent(platform || "web")}`;
+  const redirectUrl = razorpayPaymentLink.short_url;
 
   const order = await createPaymentOrder({
     id: paymentOrderId,
     userId: user.id,
     amount,
-    provider: "razorpay",
+    provider: "razorpay_payment_link",
     reference,
     checkoutToken,
-    gatewayOrderId: razorpayOrder.id,
+    gatewayOrderId: razorpayPaymentLink.id,
     redirectUrl
   });
 
