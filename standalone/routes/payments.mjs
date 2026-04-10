@@ -21,7 +21,10 @@ function isRazorpayEnabled() {
 
 function getServerOrigin(request) {
   const requestUrl = new URL(request.url);
-  const configuredOrigin = process.env.PUBLIC_API_ORIGIN?.trim() || standaloneConfig.apiUrl;
+  const configuredOrigin =
+    process.env.PAYMENTS_PUBLIC_ORIGIN?.trim() ||
+    process.env.PUBLIC_API_ORIGIN?.trim() ||
+    standaloneConfig.apiUrl;
   if (/^https?:\/\//i.test(configuredOrigin || "")) {
     return configuredOrigin.replace(/\/$/, "");
   }
