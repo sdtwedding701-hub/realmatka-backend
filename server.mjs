@@ -121,6 +121,7 @@ const standaloneRoutes = new Map([
   ["/api/notifications/history", { OPTIONS: notificationsRoutes.options, GET: notificationsRoutes.history }],
   ["/api/notifications/devices/register", { OPTIONS: notificationsRoutes.options, POST: notificationsRoutes.registerDevice }],
   ["/api/payments/create-order", { OPTIONS: paymentsRoutes.options, POST: paymentsRoutes.createOrder }],
+  ["/api/payments/status", { OPTIONS: paymentsRoutes.options, GET: paymentsRoutes.getPaymentOrderStatus, POST: paymentsRoutes.getPaymentOrderStatus }],
   ["/api/payments/upi-start", { OPTIONS: paymentsRoutes.options, GET: paymentsRoutes.startUpiDeposit, POST: paymentsRoutes.startUpiDeposit }],
   ["/api/payments/upi-report", { OPTIONS: paymentsRoutes.options, GET: paymentsRoutes.reportUpiDeposit, POST: paymentsRoutes.reportUpiDeposit }],
   ["/api/payments/upi-status", { OPTIONS: paymentsRoutes.options, GET: paymentsRoutes.getUpiDepositStatus, POST: paymentsRoutes.getUpiDepositStatus }],

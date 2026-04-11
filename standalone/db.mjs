@@ -1733,6 +1733,14 @@ async function findPaymentOrderByReference(reference) {
   );
 }
 
+export async function findPaymentOrderByReferenceForUser(userId, reference) {
+  const order = await findPaymentOrderByReference(reference);
+  if (!order || order.userId !== userId) {
+    return null;
+  }
+  return order;
+}
+
 export async function findPaymentOrderForCheckout(paymentOrderId, checkoutToken) {
   const order = await findPaymentOrderById(paymentOrderId);
   if (!order || !checkoutToken || order.checkoutToken !== checkoutToken) {
