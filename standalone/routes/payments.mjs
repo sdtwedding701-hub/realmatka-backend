@@ -3,7 +3,9 @@ import {
   completePaymentOrder,
   completePaymentLinkOrder,
   createPaymentOrder,
+  findPaymentOrderByReferenceForUser,
   findWalletEntryByReferenceId,
+  handlePaymentWebhook,
   findPaymentOrderForCheckout,
   findUserById,
   getUserBalance,
@@ -75,6 +77,27 @@ async function createRazorpayPaymentLink({ amountPaise, receipt, paymentOrderId,
   const payload = await response.json().catch(() => null);
   if (!response.ok || !payload?.id || !payload?.short_url) {
     throw new Error(payload?.error?.description || payload?.description || "Unable to create Razorpay payment link");
+  }
+
+  return payload;
+}
+
+async function fetchRazorpayPaymentLinkStatus(paymentLinkId) {
+  if (!paymentLinkId || !isRazorpayEnabled()) {
+    return null;
+  }
+
+  const response = await fetch(`https://api.razorpay.com/v1/payment_links/${encodeURIComponent(paymentLinkId)}`, {
+    method: "GET",
+    headers: {
+      Authorization: getRazorpayAuthHeader(),
+      "Content-Type": "application/json"
+    }
+  });
+
+  const payload = await response.json().catch(() => null);
+  if (!response.ok || !payload?.id) {
+    throw new Error(payload?.error?.description || payload?.description || "Unable to fetch Razorpay payment link status");
   }
 
   return payload;
@@ -289,6 +312,51 @@ export async function createOrder(request) {
     gatewayOrderId: razorpayPaymentLink.id,
     redirectUrl
   });
+
+  return ok(order, request);
+}
+
+export async function getPaymentOrderStatus(request) {
+  const user = await requireUserByToken(getSessionToken(request));
+  if (!user) {
+    return unauthorized(request);
+  }
+
+  const body = request.method.toUpperCase() === "GET" ? getRequestParams(request) : await getJsonBody(request);
+  const referenceId = String(body.referenceId ?? body.reference ?? "").trim();
+  if (!referenceId) {
+    return fail("referenceId is required", 400, request);
+  }
+
+  let order = await findPaymentOrderByReferenceForUser(user.id, referenceId);
+  if (!order) {
+    return fail("Payment order not found", 404, request);
+  }
+
+  if (order.status === "PENDING" && order.provider === "razorpay_payment_link" && order.gatewayOrderId && isRazorpayEnabled()) {
+    try {
+      const paymentLink = await fetchRazorpayPaymentLinkStatus(order.gatewayOrderId);
+      const remoteStatus = String(paymentLink?.status || "").trim().toLowerCase();
+
+      if (remoteStatus === "paid") {
+        order = await completePaymentLinkOrder({
+          reference: order.reference,
+          gatewayOrderId: String(paymentLink.order_id || order.gatewayOrderId || "").trim(),
+          gatewayPaymentId: String(paymentLink.payment_id || paymentLink.payments?.[0]?.id || "").trim(),
+          gatewaySignature: "payment_link_status_poll"
+        });
+      } else if (remoteStatus === "cancelled" || remoteStatus === "expired") {
+        order = await handlePaymentWebhook(order.reference, "FAILED");
+      } else {
+        order = {
+          ...order,
+          remoteStatus: remoteStatus || "created"
+        };
+      }
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : "Unable to verify payment status", 502, request);
+    }
+  }
 
   return ok(order, request);
 }
