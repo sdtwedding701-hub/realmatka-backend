@@ -341,8 +341,8 @@ export async function getPaymentOrderStatus(request) {
       if (remoteStatus === "paid") {
         order = await completePaymentLinkOrder({
           reference: order.reference,
-          gatewayOrderId: String(paymentLink.order_id || order.gatewayOrderId || "").trim(),
-          gatewayPaymentId: String(paymentLink.payment_id || paymentLink.payments?.[0]?.id || "").trim(),
+          gatewayOrderId: String(order.gatewayOrderId || paymentLink.id || "").trim(),
+          gatewayPaymentId: String(paymentLink.payment_id || paymentLink.payments?.[0]?.payment_id || paymentLink.payments?.[0]?.id || "").trim(),
           gatewaySignature: "payment_link_status_poll"
         });
       } else if (remoteStatus === "cancelled" || remoteStatus === "expired") {
@@ -615,9 +615,9 @@ export async function webhook(request) {
   const reference =
     String(paymentLinkEntity.reference_id || paymentLinkEntity.reference || orderEntity.receipt || "").trim();
   const gatewayOrderId =
-    String(paymentLinkEntity.order_id || orderEntity.order_id || orderEntity.id || "").trim();
+    String(paymentLinkEntity.id || paymentLinkEntity.order_id || orderEntity.order_id || orderEntity.id || "").trim();
   const gatewayPaymentId =
-    String(paymentEntity.id || orderEntity.payment_id || orderEntity.id || "").trim();
+    String(paymentEntity.id || paymentLinkEntity.payments?.[0]?.payment_id || paymentLinkEntity.payments?.[0]?.id || orderEntity.payment_id || orderEntity.id || "").trim();
 
   if (event === "payment_link.paid") {
     const updated = await completePaymentLinkOrder({
