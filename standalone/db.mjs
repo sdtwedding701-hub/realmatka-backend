@@ -81,6 +81,12 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function roundMoney(value) {
+  return Math.round(Number(value || 0) * 100) / 100;
+}
+
+const referralLossCommissionRate = Number(process.env.REFERRAL_LOSS_COMMISSION_RATE || "0.2");
+
 function toIso(value) {
   if (!value) {
     return null;
@@ -250,6 +256,34 @@ function mapPaymentOrderRow(row) {
         redirectUrl: row.redirect_url ?? null,
         createdAt: toIso(row.created_at),
         updatedAt: toIso(row.updated_at)
+      }
+    : null;
+}
+
+function mapChatConversationRow(row) {
+  return row
+    ? {
+        id: row.id,
+        userId: row.user_id,
+        status: row.status,
+        createdAt: toIso(row.created_at),
+        updatedAt: toIso(row.updated_at),
+        lastMessageAt: toIso(row.last_message_at)
+      }
+    : null;
+}
+
+function mapChatMessageRow(row) {
+  return row
+    ? {
+        id: row.id,
+        conversationId: row.conversation_id,
+        senderRole: row.sender_role,
+        senderUserId: row.sender_user_id ?? null,
+        text: row.text,
+        readByUser: toBool(row.read_by_user),
+        readByAdmin: toBool(row.read_by_admin),
+        createdAt: toIso(row.created_at)
       }
     : null;
 }
@@ -452,6 +486,28 @@ async function ensurePostgresBootstrap(pool) {
       await client.query(`ALTER TABLE payment_orders ADD COLUMN IF NOT EXISTS gateway_signature TEXT`);
       await client.query(`ALTER TABLE payment_orders ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ`);
       await client.query(`
+        CREATE TABLE IF NOT EXISTS chat_conversations (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id),
+          status TEXT NOT NULL DEFAULT 'OPEN',
+          created_at TIMESTAMPTZ NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL,
+          last_message_at TIMESTAMPTZ NOT NULL
+        )
+      `);
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS chat_messages (
+          id TEXT PRIMARY KEY,
+          conversation_id TEXT NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
+          sender_role TEXT NOT NULL,
+          sender_user_id TEXT,
+          text TEXT NOT NULL,
+          read_by_user BOOLEAN NOT NULL DEFAULT FALSE,
+          read_by_admin BOOLEAN NOT NULL DEFAULT FALSE,
+          created_at TIMESTAMPTZ NOT NULL
+        )
+      `);
+      await client.query(`
         CREATE TABLE IF NOT EXISTS app_settings (
           setting_key TEXT PRIMARY KEY,
           setting_value TEXT NOT NULL,
@@ -633,6 +689,26 @@ function getSqlite() {
       body TEXT NOT NULL,
       channel TEXT NOT NULL,
       read INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS chat_conversations (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'OPEN',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      last_message_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS chat_messages (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      sender_role TEXT NOT NULL,
+      sender_user_id TEXT,
+      text TEXT NOT NULL,
+      read_by_user INTEGER NOT NULL DEFAULT 0,
+      read_by_admin INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL
     );
 
@@ -1114,6 +1190,72 @@ export async function getWalletEntriesForUser(userId) {
   return rows.map((row) => mapWalletEntryRow(row));
 }
 
+export async function getReferralOverview(userId) {
+  if (isStandalonePostgresEnabled()) {
+    const pool = await getReadyPgPool();
+    const [referredUsersResult, referralIncomeResult] = await Promise.all([
+      pool.query(
+        `SELECT id, name, phone, joined_at
+         FROM users
+         WHERE referred_by_user_id = $1
+         ORDER BY joined_at DESC, id DESC`,
+        [userId]
+      ),
+      pool.query(
+        `SELECT COALESCE(SUM(amount), 0) AS total
+         FROM wallet_entries
+         WHERE user_id = $1
+           AND type = 'REFERRAL_COMMISSION'
+           AND status = 'SUCCESS'`,
+        [userId]
+      )
+    ]);
+
+    return {
+      referredCount: referredUsersResult.rows.length,
+      referralIncomeTotal: roundMoney(referralIncomeResult.rows[0]?.total ?? 0),
+      referredUsers: referredUsersResult.rows.map((row) => ({
+        id: row.id,
+        name: row.name,
+        phone: row.phone,
+        joinedAt: toIso(row.joined_at)
+      }))
+    };
+  }
+
+  const db = getSqlite();
+  const referredUsers = db
+    .prepare(
+      `SELECT id, name, phone, joined_at
+       FROM users
+       WHERE referred_by_user_id = ?
+       ORDER BY joined_at DESC, id DESC`
+    )
+    .all(userId)
+    .map((row) => ({
+      id: row.id,
+      name: row.name,
+      phone: row.phone,
+      joinedAt: toIso(row.joined_at)
+    }));
+
+  const referralIncomeRow = db
+    .prepare(
+      `SELECT COALESCE(SUM(amount), 0) AS total
+       FROM wallet_entries
+       WHERE user_id = ?
+         AND type = 'REFERRAL_COMMISSION'
+         AND status = 'SUCCESS'`
+    )
+    .get(userId);
+
+  return {
+    referredCount: referredUsers.length,
+    referralIncomeTotal: roundMoney(referralIncomeRow?.total ?? 0),
+    referredUsers
+  };
+}
+
 export async function getBidsForUser(userId) {
   if (isStandalonePostgresEnabled()) {
     const pool = await getReadyPgPool();
@@ -1246,6 +1388,79 @@ export async function addWalletEntry({ userId, type, status, amount, beforeBalan
   }
 
   return { id, userId, type, status, amount, beforeBalance, afterBalance, referenceId, proofUrl, note, createdAt };
+}
+
+export async function applyReferralLossCommission({ userId, lostAmount, bidId, market = "", boardLabel = "" }) {
+  const player = await findUserById(userId);
+  if (!player?.referredByUserId) {
+    return null;
+  }
+
+  const referrer = await findUserById(player.referredByUserId);
+  if (!referrer) {
+    return null;
+  }
+
+  const commissionAmount = roundMoney(Number(lostAmount || 0) * (referralLossCommissionRate / 100));
+  if (commissionAmount <= 0) {
+    return null;
+  }
+
+  const referralReferenceId = `referral-loss:${bidId}`;
+
+  if (isStandalonePostgresEnabled()) {
+    const pool = await getReadyPgPool();
+    const existingResult = await pool.query(
+      `SELECT id
+       FROM wallet_entries
+       WHERE user_id = $1
+         AND type = 'REFERRAL_COMMISSION'
+         AND reference_id = $2
+       LIMIT 1`,
+      [referrer.id, referralReferenceId]
+    );
+
+    if (existingResult.rows[0]) {
+      return null;
+    }
+  } else {
+    const existing = getSqlite()
+      .prepare(
+        `SELECT id
+         FROM wallet_entries
+         WHERE user_id = ?
+           AND type = 'REFERRAL_COMMISSION'
+           AND reference_id = ?
+         LIMIT 1`
+      )
+      .get(referrer.id, referralReferenceId);
+
+    if (existing?.id) {
+      return null;
+    }
+  }
+
+  const beforeBalance = await getUserBalance(referrer.id);
+  const note = `${player.name} loss referral income${market ? ` | ${market}` : ""}${boardLabel ? ` | ${boardLabel}` : ""}`;
+  const entry = await addWalletEntry({
+    userId: referrer.id,
+    type: "REFERRAL_COMMISSION",
+    status: "SUCCESS",
+    amount: commissionAmount,
+    beforeBalance,
+    afterBalance: beforeBalance + commissionAmount,
+    referenceId: referralReferenceId,
+    note
+  });
+
+  await createNotification({
+    userId: referrer.id,
+    title: "Referral income credited",
+    body: `Rs ${commissionAmount.toFixed(2)} referral income added from ${player.name}.`,
+    channel: "wallet"
+  });
+
+  return entry;
 }
 
 export async function addBid({ userId, market, boardLabel, sessionType, digit, points, status, payout, settledAt, settledResult }) {
@@ -1537,6 +1752,356 @@ export async function createNotification({ userId, title, body, channel = "gener
   }
 
   return { id, userId, title, body, channel, read: false, createdAt };
+}
+
+async function findChatConversationByUserId(userId) {
+  if (isStandalonePostgresEnabled()) {
+    const pool = await getReadyPgPool();
+    const result = await pool.query(
+      `SELECT id, user_id, status, created_at, updated_at, last_message_at
+       FROM chat_conversations
+       WHERE user_id = $1
+       LIMIT 1`,
+      [userId]
+    );
+    return mapChatConversationRow(result.rows[0]);
+  }
+
+  return mapChatConversationRow(
+    getSqlite()
+      .prepare(
+        `SELECT id, user_id, status, created_at, updated_at, last_message_at
+         FROM chat_conversations
+         WHERE user_id = ?
+         LIMIT 1`
+      )
+      .get(userId)
+  );
+}
+
+async function findChatConversationById(conversationId) {
+  if (isStandalonePostgresEnabled()) {
+    const pool = await getReadyPgPool();
+    const result = await pool.query(
+      `SELECT id, user_id, status, created_at, updated_at, last_message_at
+       FROM chat_conversations
+       WHERE id = $1
+       LIMIT 1`,
+      [conversationId]
+    );
+    return mapChatConversationRow(result.rows[0]);
+  }
+
+  return mapChatConversationRow(
+    getSqlite()
+      .prepare(
+        `SELECT id, user_id, status, created_at, updated_at, last_message_at
+         FROM chat_conversations
+         WHERE id = ?
+         LIMIT 1`
+      )
+      .get(conversationId)
+  );
+}
+
+async function touchChatConversation(conversationId, timestamp) {
+  if (isStandalonePostgresEnabled()) {
+    const pool = await getReadyPgPool();
+    await pool.query(
+      `UPDATE chat_conversations
+       SET updated_at = $1, last_message_at = $1
+       WHERE id = $2`,
+      [timestamp, conversationId]
+    );
+    return;
+  }
+
+  getSqlite()
+    .prepare(
+      `UPDATE chat_conversations
+       SET updated_at = ?, last_message_at = ?
+       WHERE id = ?`
+    )
+    .run(timestamp, timestamp, conversationId);
+}
+
+export async function getOrCreateSupportConversation(userId) {
+  const existing = await findChatConversationByUserId(userId);
+  if (existing) {
+    return existing;
+  }
+
+  const timestamp = nowIso();
+  const conversation = {
+    id: `chat_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    userId,
+    status: "OPEN",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    lastMessageAt: timestamp
+  };
+
+  if (isStandalonePostgresEnabled()) {
+    const pool = await getReadyPgPool();
+    await pool.query(
+      `INSERT INTO chat_conversations (id, user_id, status, created_at, updated_at, last_message_at)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [conversation.id, conversation.userId, conversation.status, conversation.createdAt, conversation.updatedAt, conversation.lastMessageAt]
+    );
+  } else {
+    getSqlite()
+      .prepare(
+        `INSERT INTO chat_conversations (id, user_id, status, created_at, updated_at, last_message_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(conversation.id, conversation.userId, conversation.status, conversation.createdAt, conversation.updatedAt, conversation.lastMessageAt);
+  }
+
+  await addSupportChatMessage({
+    conversationId: conversation.id,
+    senderRole: "support",
+    senderUserId: defaultUser.id,
+    text: "Namaste. Wallet, withdraw, market result, bonus, ya bid issue ke liye yahan message bhejiye. Support team jaldi reply karegi.",
+    readByUser: true,
+    readByAdmin: true
+  });
+
+  return findChatConversationById(conversation.id);
+}
+
+export async function addSupportChatMessage({
+  conversationId,
+  senderRole,
+  senderUserId = null,
+  text,
+  readByUser,
+  readByAdmin
+}) {
+  const trimmedText = String(text || "").trim();
+  if (!trimmedText) {
+    throw new Error("Message text is required");
+  }
+
+  const createdAt = nowIso();
+  const message = {
+    id: `chat_msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    conversationId,
+    senderRole,
+    senderUserId,
+    text: trimmedText,
+    readByUser: typeof readByUser === "boolean" ? readByUser : senderRole !== "support",
+    readByAdmin: typeof readByAdmin === "boolean" ? readByAdmin : senderRole !== "user",
+    createdAt
+  };
+
+  if (isStandalonePostgresEnabled()) {
+    const pool = await getReadyPgPool();
+    await pool.query(
+      `INSERT INTO chat_messages (id, conversation_id, sender_role, sender_user_id, text, read_by_user, read_by_admin, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [message.id, message.conversationId, message.senderRole, message.senderUserId, message.text, message.readByUser, message.readByAdmin, message.createdAt]
+    );
+  } else {
+    getSqlite()
+      .prepare(
+        `INSERT INTO chat_messages (id, conversation_id, sender_role, sender_user_id, text, read_by_user, read_by_admin, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        message.id,
+        message.conversationId,
+        message.senderRole,
+        message.senderUserId,
+        message.text,
+        message.readByUser ? 1 : 0,
+        message.readByAdmin ? 1 : 0,
+        message.createdAt
+      );
+  }
+
+  await touchChatConversation(conversationId, createdAt);
+  return message;
+}
+
+export async function getSupportMessages(conversationId) {
+  if (isStandalonePostgresEnabled()) {
+    const pool = await getReadyPgPool();
+    const result = await pool.query(
+      `SELECT id, conversation_id, sender_role, sender_user_id, text, read_by_user, read_by_admin, created_at
+       FROM chat_messages
+       WHERE conversation_id = $1
+       ORDER BY created_at ASC, id ASC`,
+      [conversationId]
+    );
+    return result.rows.map((row) => mapChatMessageRow(row));
+  }
+
+  return getSqlite()
+    .prepare(
+      `SELECT id, conversation_id, sender_role, sender_user_id, text, read_by_user, read_by_admin, created_at
+       FROM chat_messages
+       WHERE conversation_id = ?
+       ORDER BY created_at ASC, id ASC`
+    )
+    .all(conversationId)
+    .map((row) => mapChatMessageRow(row));
+}
+
+export async function markSupportMessagesReadByUser(conversationId) {
+  if (isStandalonePostgresEnabled()) {
+    const pool = await getReadyPgPool();
+    await pool.query(
+      `UPDATE chat_messages
+       SET read_by_user = TRUE
+       WHERE conversation_id = $1
+         AND sender_role = 'support'
+         AND read_by_user = FALSE`,
+      [conversationId]
+    );
+    return;
+  }
+
+  getSqlite()
+    .prepare(
+      `UPDATE chat_messages
+       SET read_by_user = 1
+       WHERE conversation_id = ?
+         AND sender_role = 'support'
+         AND read_by_user = 0`
+    )
+    .run(conversationId);
+}
+
+export async function markSupportMessagesReadByAdmin(conversationId) {
+  if (isStandalonePostgresEnabled()) {
+    const pool = await getReadyPgPool();
+    await pool.query(
+      `UPDATE chat_messages
+       SET read_by_admin = TRUE
+       WHERE conversation_id = $1
+         AND sender_role = 'user'
+         AND read_by_admin = FALSE`,
+      [conversationId]
+    );
+    return;
+  }
+
+  getSqlite()
+    .prepare(
+      `UPDATE chat_messages
+       SET read_by_admin = 1
+       WHERE conversation_id = ?
+         AND sender_role = 'user'
+         AND read_by_admin = 0`
+    )
+    .run(conversationId);
+}
+
+export async function getSupportConversationBundleForUser(userId) {
+  const conversation = await getOrCreateSupportConversation(userId);
+  const messages = await getSupportMessages(conversation.id);
+  return { conversation, messages };
+}
+
+export async function listSupportConversations() {
+  if (isStandalonePostgresEnabled()) {
+    const pool = await getReadyPgPool();
+    const result = await pool.query(
+      `SELECT
+         c.id,
+         c.user_id,
+         c.status,
+         c.created_at,
+         c.updated_at,
+         c.last_message_at,
+         u.name AS user_name,
+         u.phone AS user_phone,
+         (
+           SELECT text
+           FROM chat_messages
+           WHERE conversation_id = c.id
+           ORDER BY created_at DESC, id DESC
+           LIMIT 1
+         ) AS last_message_text,
+         (
+           SELECT COUNT(*)::int
+           FROM chat_messages
+           WHERE conversation_id = c.id
+             AND sender_role = 'user'
+             AND read_by_admin = FALSE
+         ) AS unread_for_admin
+       FROM chat_conversations c
+       JOIN users u ON u.id = c.user_id
+       ORDER BY c.last_message_at DESC, c.id DESC`
+    );
+    return result.rows.map((row) => ({
+      ...mapChatConversationRow(row),
+      userName: row.user_name,
+      userPhone: row.user_phone,
+      lastMessageText: row.last_message_text ?? "",
+      unreadForAdmin: Number(row.unread_for_admin ?? 0)
+    }));
+  }
+
+  return getSqlite()
+    .prepare(
+      `SELECT
+         c.id,
+         c.user_id,
+         c.status,
+         c.created_at,
+         c.updated_at,
+         c.last_message_at,
+         u.name AS user_name,
+         u.phone AS user_phone,
+         (
+           SELECT text
+           FROM chat_messages
+           WHERE conversation_id = c.id
+           ORDER BY created_at DESC, id DESC
+           LIMIT 1
+         ) AS last_message_text,
+         (
+           SELECT COUNT(*)
+           FROM chat_messages
+           WHERE conversation_id = c.id
+             AND sender_role = 'user'
+             AND read_by_admin = 0
+         ) AS unread_for_admin
+       FROM chat_conversations c
+       JOIN users u ON u.id = c.user_id
+       ORDER BY c.last_message_at DESC, c.id DESC`
+    )
+    .all()
+    .map((row) => ({
+      ...mapChatConversationRow(row),
+      userName: row.user_name,
+      userPhone: row.user_phone,
+      lastMessageText: row.last_message_text ?? "",
+      unreadForAdmin: Number(row.unread_for_admin ?? 0)
+    }));
+}
+
+export async function getSupportConversationDetailsForAdmin(conversationId) {
+  const conversation = await findChatConversationById(conversationId);
+  if (!conversation) {
+    return null;
+  }
+
+  const user = await findUserById(conversation.userId);
+  const messages = await getSupportMessages(conversation.id);
+
+  return {
+    conversation,
+    user: user
+      ? {
+          id: user.id,
+          name: user.name,
+          phone: user.phone
+        }
+      : null,
+    messages
+  };
 }
 
 export async function listAllNotifications(limit = 200) {

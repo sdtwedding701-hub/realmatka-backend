@@ -96,6 +96,7 @@ const notificationsRoutes = await import("./standalone/routes/notifications.mjs"
 const paymentsRoutes = await import("./standalone/routes/payments.mjs");
 const marketsRoutes = await import("./standalone/routes/markets.mjs");
 const bidsPlaceRoutes = await import("./standalone/routes/bids-place.mjs");
+const chatRoutes = await import("./standalone/routes/chat.mjs");
 const adminRoutes = await import("./standalone/routes/admin.mjs");
 const standaloneRoutes = new Map([
   ["/api/auth/login", { OPTIONS: authRoutes.options, POST: authRoutes.login }],
@@ -108,6 +109,7 @@ const standaloneRoutes = new Map([
   ["/api/auth/update-password", { OPTIONS: authAccountRoutes.options, POST: authAccountRoutes.updatePassword }],
   ["/api/auth/update-mpin", { OPTIONS: authAccountRoutes.options, POST: authAccountRoutes.updateMpin }],
   ["/api/profile/update", { OPTIONS: profileRoutes.options, POST: profileRoutes.update }],
+  ["/api/profile/referrals", { OPTIONS: profileRoutes.options, GET: profileRoutes.referrals }],
   ["/api/wallet/balance", { OPTIONS: walletBalanceRoutes.options, GET: walletBalanceRoutes.balance }],
   ["/api/wallet/history", { OPTIONS: walletRoutes.options, GET: walletRoutes.history }],
   ["/api/wallet/deposit", { OPTIONS: walletRoutes.options, POST: walletRoutes.deposit }],
@@ -120,6 +122,8 @@ const standaloneRoutes = new Map([
   ["/api/markets/list", { OPTIONS: marketsRoutes.options, GET: marketsRoutes.list }],
   ["/api/notifications/history", { OPTIONS: notificationsRoutes.options, GET: notificationsRoutes.history }],
   ["/api/notifications/devices/register", { OPTIONS: notificationsRoutes.options, POST: notificationsRoutes.registerDevice }],
+  ["/api/chat/conversation", { OPTIONS: chatRoutes.options, GET: chatRoutes.userConversation }],
+  ["/api/chat/send", { OPTIONS: chatRoutes.options, POST: chatRoutes.userSend }],
   ["/api/payments/create-order", { OPTIONS: paymentsRoutes.options, POST: paymentsRoutes.createOrder }],
   ["/api/payments/status", { OPTIONS: paymentsRoutes.options, GET: paymentsRoutes.getPaymentOrderStatus, POST: paymentsRoutes.getPaymentOrderStatus }],
   ["/api/payments/upi-start", { OPTIONS: paymentsRoutes.options, GET: paymentsRoutes.startUpiDeposit, POST: paymentsRoutes.startUpiDeposit }],
@@ -148,7 +152,10 @@ const standaloneRoutes = new Map([
   ["/api/admin/export", { OPTIONS: adminRoutes.options, GET: adminRoutes.exportData }],
   ["/api/admin/backup-snapshot", { OPTIONS: adminRoutes.options, GET: adminRoutes.backupSnapshot, POST: adminRoutes.restoreSnapshot }],
   ["/api/admin/dashboard-summary", { OPTIONS: adminRoutes.options, GET: adminRoutes.dashboardSummary }],
-  ["/api/admin/reports-summary", { OPTIONS: adminRoutes.options, GET: adminRoutes.reportsSummary }]
+  ["/api/admin/reports-summary", { OPTIONS: adminRoutes.options, GET: adminRoutes.reportsSummary }],
+  ["/api/admin/chat-conversations", { OPTIONS: chatRoutes.options, GET: chatRoutes.adminConversations }],
+  ["/api/admin/chat-messages", { OPTIONS: chatRoutes.options, GET: chatRoutes.adminMessages }],
+  ["/api/admin/chat-send", { OPTIONS: chatRoutes.options, POST: chatRoutes.adminSend }]
 ]);
 
 let cachedManifest = null;
